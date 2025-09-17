@@ -1,27 +1,26 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:google_maps_flutter/google_maps_flutter.dart';
-import 'package:geolocator/geolocator.dart';
-import 'package:firebase_auth/firebase_auth.dart';
 import 'package:provider/provider.dart';
 
 import '../providers/check_in_provider.dart';
 import '../services/location_service.dart';
 import '../widgets/fake_location_widget.dart';
 
+
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
 
   @override
-  State<HomeScreen> createState() => _HomeScreenState();
+  _HomeScreenState createState() => _HomeScreenState();
 }
 
 class _HomeScreenState extends State<HomeScreen> {
   LatLng? _currentLocation;
-  StreamSubscription<Position>? _posSub;
+  StreamSubscription? _positionSubscription;
   LatLng? _pickedLatLng;
   double _radius = 50;
-  final String _userId = FirebaseAuth.instance.currentUser?.uid ?? 'anonymous';
+  final String _userId = 'user_${DateTime.now().millisecondsSinceEpoch}';
 
   @override
   void initState() {
@@ -30,23 +29,23 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _initLocation() async {
-    final ok = await LocationService.isPermissionGranted();
-    if (!ok) return;
-    final pos = await LocationService.getCurrentPosition();
-    setState(() => _currentLocation = LatLng(pos.latitude, pos.longitude));
+    final permissionGranted = await LocationService.isPermissionGranted();
+    if (!permissionGranted) return;
 
-    _posSub = LocationService.getPositionStream().listen((p) {
-      setState(() => _currentLocation = LatLng(p.latitude, p.longitude));
-      context.read<CheckInProvider>().checkOutIfOutside(
-        _userId,
-        _currentLocation!,
-      );
+    final position = await LocationService.getCurrentPosition();
+    context.read<CheckInProvider>().updateCurrentLocation(
+        LatLng(position.latitude, position.longitude), _userId);
+
+    _positionSubscription = LocationService.getPositionStream().listen((position) {
+      context.read<CheckInProvider>().updateCurrentLocation(
+          LatLng(position.latitude, position.longitude), _userId);
     });
   }
 
+
   @override
   void dispose() {
-    _posSub?.cancel();
+    _positionSubscription?.cancel();
     super.dispose();
   }
 
@@ -54,64 +53,68 @@ class _HomeScreenState extends State<HomeScreen> {
   Widget build(BuildContext context) {
     final provider = context.watch<CheckInProvider>();
     final active = provider.activePoint;
+    final currentLocation = provider.currentLocation;
+    final pickedLatLng = provider.pickedLocation;
 
     final markers = <Marker>{};
     if (_currentLocation != null) {
-      markers.add(
-        Marker(markerId: MarkerId('me'), position: _currentLocation!),
-      );
+      markers.add(Marker(markerId: MarkerId('self'), position: _currentLocation!));
     }
     if (_pickedLatLng != null) {
-      markers.add(
-        Marker(markerId: MarkerId('picked'), position: _pickedLatLng!),
-      );
+      markers.add(Marker(markerId: MarkerId('picked'), position: _pickedLatLng!));
     }
     if (active != null) {
-      markers.add(
-        Marker(markerId: MarkerId('active'), position: active.location),
-      );
+      markers.add(Marker(markerId: MarkerId('active'), position: active.location));
     }
+
     return Scaffold(
       appBar: AppBar(
-        title: Text('CheckInApp'),
+        title: Text('CheckIn-Out App'),
         actions: [
           Padding(
             padding: const EdgeInsets.all(12.0),
             child: Center(child: Text('Live: ${provider.liveCount}')),
-          ),
+          )
         ],
       ),
       body: Column(
         children: [
           Expanded(
-            child: _currentLocation == null
+            child: currentLocation == null
                 ? Center(child: CircularProgressIndicator())
                 : GoogleMap(
-                    initialCameraPosition: CameraPosition(
-                      target: _currentLocation!,
-                      zoom: 16,
-                    ),
-                    markers: markers,
-                    onTap: (latLng) => setState(() => _pickedLatLng = latLng),
-                    circles: active != null
-                        ? {
-                            Circle(
-                              circleId: CircleId('active-radius'),
-                              center: active.location,
-                              radius: active.radiusMeters,
-                              fillColor: Colors.blue.withOpacity(0.15),
-                              strokeColor: Colors.blue,
-                              strokeWidth: 2,
-                            ),
-                          }
-                        : {},
-                  ),
+              initialCameraPosition: CameraPosition(
+                target: currentLocation,
+                zoom: 16,
+              ),
+              markers: {
+                if (currentLocation != null)
+                  Marker(markerId: MarkerId('self'), position: currentLocation),
+                if (provider.pickedLocation != null)
+                  Marker(markerId: MarkerId('picked'), position: provider.pickedLocation!),
+                if (active != null)
+                  Marker(markerId: MarkerId('active'), position: active.location),
+              },
+              onTap: (latLng) => provider.pickLocation(latLng), // ✅ update provider
+              circles: active != null
+                  ? {
+                Circle(
+                  circleId: CircleId('active-radius'),
+                  center: active.location,
+                  radius: active.radiusMeters,
+                  fillColor: Colors.blue.withOpacity(0.15),
+                  strokeColor: Colors.blue,
+                  strokeWidth: 2,
+                )
+              }
+                  : {},
+            )
+
           ),
-          _buildControls(provider),
+          _buildControls(context,provider),
           FakeLocationWidget(
-            onLocationSet: (latlng) {
-              setState(() => _currentLocation = latlng);
-              context.read<CheckInProvider>().checkOutIfOutside(_userId, latlng);
+            onLocationSet: (latLng) {
+              provider.updateCurrentLocation(latLng, _userId);
             },
           ),
         ],
@@ -119,8 +122,9 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  Widget _buildControls(CheckInProvider provider) {
+  Widget _buildControls(BuildContext context, CheckInProvider provider) {
     final active = provider.activePoint;
+
     return Container(
       color: Colors.grey[100],
       padding: EdgeInsets.all(12),
@@ -134,57 +138,68 @@ class _HomeScreenState extends State<HomeScreen> {
                   child: Slider(
                     min: 10,
                     max: 500,
-                    value: _radius,
-                    onChanged: (v) => setState(() => _radius = v),
+                    value: provider.radius,
+                    onChanged: (v) => provider.setRadius(v),
                   ),
                 ),
-                Text('${_radius.toInt()}m'),
+                Text('${provider.radius.toInt()}m'),
               ],
             ),
+
             ElevatedButton(
-              onPressed: _pickedLatLng == null
+              onPressed: provider.pickedLocation == null
                   ? null
                   : () async {
-                      await provider.createCheckInPoint(
-                        location: _pickedLatLng!,
-                        radiusMeters: _radius,
-                        createdBy: _userId,
-                      );
-                    },
+                await provider.createCheckInPoint(
+                  location: provider.pickedLocation!,
+                  radiusMeters: _radius,
+                  createdBy: _userId,
+                );
+              },
               child: Text('Create Check-in Point'),
             ),
           ] else ...[
             Text(
-              'Active check-in by ${active.createdBy} — Radius ${active.radiusMeters.toInt()}m',
+              'Active check-in created by ${active.createdBy}\n'
+                  'Radius: ${active.radiusMeters.toInt()}m',
+              textAlign: TextAlign.center,
             ),
-            ElevatedButton(
-              onPressed: () async {
-                if (_currentLocation == null) return;
-                final success = await provider.tryCheckIn(
-                  _userId,
-                  _currentLocation!,
-                );
-                ScaffoldMessenger.of(context).showSnackBar(
-                  SnackBar(
+
+            const SizedBox(height: 8),
+
+            if (active.createdBy == _userId)
+              ElevatedButton(
+                style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
+                onPressed: () async {
+                  await provider.removeCheckInPoint();
+                },
+                child: Text('Remove (Owner)'),
+              )
+            else
+              ElevatedButton(
+                onPressed: provider.currentLocation == null
+                    ? null
+                    : () async {
+                  final success = await provider.tryCheckIn(
+                    _userId,
+                    provider.currentLocation!,
+                  );
+                  ScaffoldMessenger.of(context).showSnackBar(SnackBar(
                     content: Text(
-                      success ? 'Check-in successful' : 'Not within radius',
+                      success
+                          ? 'Check-in successful'
+                          : 'Not within radius',
                     ),
-                  ),
-                );
-              },
-              child: Text('Check In'),
-            ),
-            ElevatedButton(
-              onPressed: provider.activePoint?.createdBy == _userId
-                  ? () async => await provider.removeCheckInPoint()
-                  : null,
-              child: Text('Remove (owner)'),
-            ),
+                  ));
+                },
+                child: Text('Check In'),
+              ),
           ],
-          SizedBox(height: 8),
+          const SizedBox(height: 8),
           Text('Live check-ins: ${provider.liveCount}'),
         ],
       ),
     );
   }
+
 }
